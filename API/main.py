@@ -1,250 +1,155 @@
-#https://fastapi.tiangolo.com/#installation
-from fastapi import FastAPI, HTTPException
-from db import get_db_connection
-from models import Usuari, Material, Reserva
-# from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel, EmailStr
+import smtplib
+import uuid
+import mysql.connector
+from typing import Optional
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+from dotenv import load_dotenv
+import os
+from database import inicialitzar_base_dades  # Importa la funció
 
-import time
+# Càrrega de variables d'entorn
+load_dotenv()
 
-DELAY_TIME=3
+# Configura la connexió a MariaDB
+db_config = {
+    'host': os.getenv("DB_HOST"),
+    'user': os.getenv("DB_USER"),
+    'password': os.getenv("DB_PASSWORD"),
+    'database': os.getenv("DB_NAME"),
+    'collation': 'utf8mb4_general_ci'
+}
+
+# Inicialitza la base de dades
+inicialitzar_base_dades(db_config)
+    
+# Configura la connexió a la base de dades
+conn = conn = mysql.connector.connect(**db_config)
+cursor = conn.cursor()
 
 app = FastAPI()
-# Configura els origens permesos
-# origins = [
-#     "http://127.0.0.1:8443",  # Per React o altres frameworks en desenvolupament
-#     "http://reservesapi:8443",  # Si accedeixes des del mateix servidor
-#     "*",  # des de tot arreu.
-# ]
 
-# Afegeix el middleware de CORS
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=origins,  # Origines permesos
-#     allow_credentials=True, # Permetre cookies i autenticació
-#     allow_methods=["*"],    # Permetre tots els mètodes HTTP (GET, POST, PUT, DELETE, etc.)
-#     allow_headers=["*"],    # Permetre tots els encapçalaments
-# )
+# Clau secreta per a JWT
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-@app.get("/")
-def home():
-    return {"message": "API RESERVES, amb FastAPI i MariaDB sense routers"}
+# Configuració de bcrypt
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# CRUD per a Usuaris
-@app.post("/usuaris/")
-def crear_usuari(usuari: Usuari):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# Configuració del servidor de correu
+EMAIL_HOST = os.getenv("EMAIL_HOST")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT"))
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TOKEN_CONFIRMATION_URL = os.getenv("TOKEN_CONFIRMATION_URL")
+
+# Model per al registre d'usuaris
+class UserCreate(BaseModel):
+    nom_usuari: str
+    email: EmailStr
+    contrassenya: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    contrassenya: str
+
+# Funció per encriptar contrasenyes
+def hash_contrassenya(contrassenya: str) -> str:
+    return pwd_context.hash(contrassenya)
+
+# Funció per verificar contrasenyes
+def verificar_contrassenya(contrassenya: str, hashed: str) -> bool:
+    return pwd_context.verify(contrassenya, hashed)
+
+# Generar token JWT
+def crear_token_daccess(data: dict, expires_delta: timedelta):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# Enviar correu de confirmació
+def enviar_correu_confirmacio(email: str, token: str):
+    missatge = f"Subject: Confirma el teu compte\n\nFeu clic aqui per validar el compte: {TOKEN_CONFIRMATION_URL}/{token}"
+   
+    try:
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+            #server.starttls()
+            #server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, email, missatge)
+    except Exception as e:
+        print("Error enviant correu:", e)
+
+@app.post("/registre/")
+def registre_usuari(usuari: UserCreate):
+    token = str(uuid.uuid4())
+    hashed_password = hash_contrassenya(usuari.contrassenya)
     try:
         cursor.execute(
-            "INSERT INTO usuaris (id, nom, rol, password) VALUES (%s, %s, %s, %s)",
-            (usuari.id, usuari.nom, usuari.rol, usuari.password),
+            "INSERT INTO usuaris (nom_usuari, email, contrassenya, token, validat) VALUES (%s, %s, %s, %s, %s)",
+            (usuari.nom_usuari, usuari.email, hashed_password, token, False)
         )
         conn.commit()
+        enviar_correu_confirmacio(usuari.email, token)
+        return {"missatge": "Usuari registrat. Comprova el teu correu per validar-lo."}
     except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Usuari creat correctament"}
-
-@app.get("/usuaris/{id}")
-def obtenir_usuari(id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM usuaris WHERE id = %s", (id,))
-    usuari = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not usuari:
-        raise HTTPException(status_code=404, detail="Usuari no trobat")
-    return usuari
-
-@app.get("/login/{usuari}")
-def obtenir_usuari(usuari: str):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id,nom,rol FROM usuaris WHERE nom = %s", (usuari,))    
-    usuari = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not usuari:
-        raise HTTPException(status_code=404, detail="Usuari no trobat")
-    return usuari
-
-#1. Afegir Material (POST)
-@app.post("/materials/")
-def crear_material(material: Material):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO materials (id, descripcio, imatge) VALUES (%s, %s, %s)",
-            (material.id, material.descripcio, material.imatge),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Material creat correctament"}
-
-
-#2. Obtenir Material per ID (GET)
-@app.get("/materials/{id}")
-def obtenir_material(id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM materials WHERE id = %s", (id,))
-    material = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not material:
-        raise HTTPException(status_code=404, detail="Material no trobat")
-    return material
-
-#3. Obtenir tots els Materials (GET)
-@app.get("/materials/")
-def obtenir_tots_materials():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM materials")
-    materials = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return materials
-
-#4. Modificar Material (PUT)
-@app.put("/materials/{id}")
-def modificar_material(id: int, material: Material):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "UPDATE materials SET descripcio = %s, imatge = %s WHERE id = %s",
-            (material.descripcio, material.imatge, id),
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Material no trobat")
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Material actualitzat correctament"}
-
-#5. Eliminar Material (DELETE)
-@app.delete("/materials/{id}")
-def eliminar_material(id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("DELETE FROM materials WHERE id = %s", (id,))
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Material no trobat")
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Material eliminat correctament"}
-
-#-----------------------------------------------------------------------
-#   RESERVES
-#-----------------------------------------------------------------------
-
-#1. Afegir Reserva (POST)
-@app.post("/reserves/")
-def crear_reserva(reserva: Reserva):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO reserves (idusuari, idmaterial, datareserva, datafinal) VALUES (%s, %s, %s, %s)",
-            (reserva.idusuari, reserva.idmaterial, reserva.datareserva, reserva.datafinal),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Reserva creada correctament"}
-
-#2. Obtenir Reserva per ID (GET)
-@app.get("/reserves/{idusuari}/{idmaterial}/{datareserva}")
-def obtenir_reserva(idusuari: int, idmaterial: int, datareserva: str):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+        raise HTTPException(status_code=400, detail=f"Error: {e}")
+    
+# Endpoint per validar un usuari
+@app.get("/validar/{token}")
+def validar_usuari(token: str):
     cursor.execute(
-        "SELECT * FROM reserves WHERE idusuari = %s AND idmaterial = %s AND datareserva = %s",
-        (idusuari, idmaterial, datareserva),
+        "SELECT id FROM usuaris WHERE token = %s AND validat = %s",
+        (token, False)
     )
-    reserva = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not reserva:
-        raise HTTPException(status_code=404, detail="Reserva no trobada")
-    return reserva
+    usuari = cursor.fetchone()
+    if not usuari:
+        raise HTTPException(status_code=400, detail="Token invàlid o usuari ja validat")
+    
+    cursor.execute(
+        "UPDATE usuaris SET validat = %s WHERE token = %s",
+        (True, token)
+    )
+    conn.commit()
+    return {"missatge": "Compte validat correctament."}
 
-#3. Obtenir totes les Reserves d'un Usuari (GET)
-@app.get("/reserves/usuari/{idusuari}")
-def obtenir_reserves_usuari(idusuari: int):
-    time.sleep(DELAY_TIME)
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT reserves.*,materials.descripcio as descripcio,materials.imatge FROM reserves inner join materials on reserves.idmaterial=materials.id WHERE idusuari = %s", (idusuari,))
-    reserves = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return reserves
 
-#4. Modificar Reserva (PUT)
-@app.put("/reserves/{idusuari}/{idmaterial}/{datareserva}")
-def modificar_reserva(idusuari: int, idmaterial: int, datareserva: str, reserva: Reserva):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# Endpoint per iniciar sessió i obtenir token JWT
+@app.post("/login/")
+def iniciar_sessio(usuari: UserLogin):
+    cursor.execute(
+        "SELECT id, nom_usuari, email, contrassenya FROM usuaris WHERE email = %s AND validat = %s",
+        (usuari.email, True)
+    )
+    usuari_db = cursor.fetchone()
+    
+    if not usuari_db or not verificar_contrassenya(usuari.contrassenya, usuari_db[3]):
+        raise HTTPException(status_code=400, detail="Credencials incorrectes o usuari no validat")
+    
+    token_expire = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = crear_token_daccess({"sub": usuari_db[0]}, token_expire)
+    
+    return {
+        "id": usuari_db[0],  # L'id és un Int (no cal convertir-lo a String)
+        "nom_usuari": usuari_db[1],
+        "email": usuari_db[2],
+        "contrassenya": usuari_db[3],  # Incloem la contrasenya (encriptada)
+        "access_token": token,  # El camp es diu "access_token" a la resposta JSON
+        "token_type": "bearer"  # El camp es diu "token_type" a la resposta JSON
+    }
+
+# Endpoint protegit amb JWT
+@app.get("/perfil/")
+def perfil_usuari(token: str):
     try:
-        cursor.execute(
-            "UPDATE reserves SET datafinal = %s WHERE idusuari = %s AND idmaterial = %s AND datareserva = %s",
-            (reserva.datafinal, idusuari, idmaterial, datareserva),
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Reserva no trobada")
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Reserva actualitzada correctament"}
-
-#5. Eliminar Reserva (DELETE)
-
-@app.delete("/reserves/{idusuari}/{idmaterial}/{datareserva}")
-def eliminar_reserva(idusuari: int, idmaterial: int, datareserva: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "DELETE FROM reserves WHERE idusuari = %s AND idmaterial = %s AND datareserva = %s",
-            (idusuari, idmaterial, datareserva),
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Reserva no trobada")
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-    return {"message": "Reserva eliminada correctament"}
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        usuari_id = payload.get("sub")
+        if usuari_id is None:
+            raise HTTPException(status_code=401, detail="Token invàlid")
+        return {"missatge": f"Benvingut, usuari {usuari_id}"}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="No autoritzat")

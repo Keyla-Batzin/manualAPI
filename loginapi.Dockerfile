@@ -6,10 +6,10 @@ EXPOSE 443
 WORKDIR /app
 
 # Copia les dependències (requirements.txt) dins del contenidor
-COPY API/requirements.txt /app/requirements.txt
+COPY ./API/requirements.txt /app/requirements.txt
 
 # Instal·la les dependències necessàries
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copia tota l'aplicació FastAPI dins del contenidor
 COPY API /app/
